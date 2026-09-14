@@ -72,10 +72,28 @@ const ROUTERS = [
   { url: c => `https://router.project-osrm.org/route/v1/foot/${c}?overview=full&geometries=geojson`,             trustDuration: false }
 ];
 
+/* Cortacircuitos: si los routers fallan varias veces seguidas (caídos, o
+   limitando por exceso de peticiones), dejamos de insistir y estimamos el
+   resto al momento. Sin esto, cada tramo se come el timeout de los dos
+   routers y la lista se queda minutos en "calculando…". */
+const breaker = { fails: 0, limit: 3, open: false };
+
+function estimate(a, b){
+  const d = haversine(a, b) * DETOUR;
+  return {
+    distance : d,
+    duration : walkSeconds(d),
+    estimated: true,
+    line     : [[a.lat, a.lng], [b.lat, b.lng]]
+  };
+}
+
 async function fetchLeg(a, b){
   const key = `leg:${a.lat.toFixed(5)},${a.lng.toFixed(5)}>${b.lat.toFixed(5)},${b.lng.toFixed(5)}`;
   const hit = store.get(key);
   if (hit) return hit;
+
+  if (breaker.open) return estimate(a, b);
 
   const coords   = `${a.lng},${a.lat};${b.lng},${b.lat}`;
   const straight = haversine(a, b);
@@ -83,7 +101,7 @@ async function fetchLeg(a, b){
   for (const r of ROUTERS){
     try{
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 9000);
+      const timer = setTimeout(() => ctrl.abort(), 6000);
       const res = await fetch(r.url(coords), { signal: ctrl.signal });
       clearTimeout(timer);
       if (!res.ok) throw new Error(res.status);
@@ -106,18 +124,15 @@ async function fetchLeg(a, b){
         line     : route.geometry.coordinates.map(([lng, lat]) => [lat, lng])
       };
       store.set(key, leg);
+      breaker.fails = 0;
       return leg;
     }catch{ /* siguiente router */ }
   }
 
-  // Fallback: haversine con factor de rodeo. No se cachea, para reintentar luego.
-  const d = haversine(a, b) * DETOUR;
-  return {
-    distance : d,
-    duration : walkSeconds(d),
-    estimated: true,
-    line     : [[a.lat, a.lng], [b.lat, b.lng]]
-  };
+  // Ningun router ha respondido: contamos el fallo y estimamos.
+  // La estimacion no se cachea, para reintentar la ruta real mas adelante.
+  if (++breaker.fails >= breaker.limit) breaker.open = true;
+  return estimate(a, b);
 }
 
 /* =========================================================
